@@ -109,3 +109,180 @@ We add our final component and update the system's overall description.
 | :--- | :--- | :--- |
 | **GeoDNS** | **AWS Route 53** with Geolocation Routing Policy | A highly available and scalable managed DNS service. Its geolocation routing feature is the ideal tool for directing users to the lowest-latency regional endpoint. |
 | **ClassifyHub Regional Deployment** | The entire Multi-AZ architecture from Issue #12, deployed as a stamp in multiple AWS Regions. | Replicating the entire stack ensures that each region is independent, resilient, and provides the full set of application features to its local users. |
+
+#### **Overall Logical Architecture Diagram**
+
+```mermaid
+C4Container
+    title Overall Logical Architecture for ClassifyHub (Final)
+
+    Person(user, "Authenticated User", "A user of the application.")
+    Person(engineer, "On-Call Engineer", "Receives alerts about system health.")
+    System(email_service, "Email Service", "External service that delivers emails.")
+
+    System_Boundary(c1, "ClassifyHub System") {
+    
+        %% --- Edge & Entry Points ---
+        Container(cdn, "CDN", "AWS CloudFront", "Caches and serves static assets (UI, images) from global edge locations.")
+        Container(api_gateway, "API Gateway", "Highly available, load-balanced single entry point for all API traffic. Enforces rate limiting.")
+
+        %% --- Core Application Services ---
+        Container(frontend_service, "Frontend Service", "Provides the UI assets (Origin for CDN).")
+        Container(backend_service, "Backend Service", "Horizontally scalable service. Handles business logic, auth, and data orchestration.")
+        Container(search_service, "Search Service", "Managed, Multi-AZ OpenSearch Cluster. Provides the full-text search API.")
+        Container(notification_worker, "Notification Worker", "Processes background jobs asynchronously from the message queue.")
+
+        %% --- Data & Messaging Stores ---
+        ContainerDb(sql_database, "SQL Database Cluster", "Managed, Multi-AZ PostgreSQL (RDS). The single source of truth.")
+        ContainerDb(cache_service, "Cache Service", "Managed, Multi-AZ Redis (ElastiCache). Stores cached data and rate-limit counters.")
+        ContainerDb(object_store, "Object Store", "AWS S3. Stores all user-uploaded images.")
+        ContainerDb(message_queue, "Message Queue", "AWS SQS. Buffers notification jobs for reliable, asynchronous processing.")
+
+        %% --- Observability Stack (Cross-Cutting Concern) ---
+        System_Boundary(observability_stack, "Observability Stack") {
+            Container(logging, "Log Aggregation", "AWS CloudWatch Logs", "Collects logs from all services.")
+            Container(metrics, "Metrics & Monitoring", "AWS CloudWatch Metrics", "Collects metrics and provides dashboards.")
+            Container(alerting, "Alerting", "AWS CloudWatch Alarms & SNS", "Triggers and sends alerts based on metric thresholds.")
+        }
+    }
+
+    %% --- Relationships ---
+
+    %% 1. User Interaction Flow
+    Rel(user, cdn, "Loads UI and Images", "HTTPS")
+    Rel(user, api_gateway, "Makes API/Search Requests", "HTTPS")
+
+    %% 2. Edge & Routing
+    Rel(cdn, frontend_service, "Pulls UI Assets (Origin)")
+    Rel(cdn, object_store, "Pulls Images (Origin)")
+    Rel(api_gateway, backend_service, "Routes API Requests")
+    Rel(api_gateway, search_service, "Routes Search Queries")
+    Rel(api_gateway, cache_service, "Checks Rate-Limit Counters")
+
+    %% 3. Backend Service Orchestration
+    Rel(backend_service, sql_database, "Reads/Writes Data")
+    Rel(backend_service, cache_service, "Reads/Writes Post Cache")
+    Rel(backend_service, search_service, "Writes to Search Index")
+    Rel(backend_service, object_store, "Writes Image Files")
+    Rel(backend_service, message_queue, "Publishes Notification Job")
+
+    %% 4. Asynchronous Notification Flow
+    Rel(notification_worker, message_queue, "Consumes Job")
+    Rel(notification_worker, email_service, "Sends Email")
+    
+    %% 5. Observability Data Flow (Examples)
+    Rel(backend_service, logging, "Sends Logs")
+    Rel(backend_service, metrics, "Sends Metrics")
+    Rel(sql_database, metrics, "Sends Performance Metrics")
+    Rel(metrics, alerting, "Feeds Metrics Into")
+    Rel(alerting, engineer, "Sends Alerts To")
+```
+
+#### **Overall Physical Architecture Diagram**
+
+```mermaid
+graph TD
+    %% --- Define Actors & External Systems ---
+    subgraph "Internet"
+        user_client["User's Browser"]
+        on_call_engineer["On-Call Engineer"]
+    end
+    
+    email_service["External Email Service"]
+
+    %% --- Define Cloud Infrastructure ---
+    subgraph AWS_Cloud ["AWS Cloud"]
+    
+        %% 1. Global & Edge Services
+        route53["Route 53 (GeoDNS)"]
+        cloudfront["CloudFront (CDN)"]
+
+        %% 2. Regional Managed Services (outside VPC for clarity)
+        s3_bucket["S3 Bucket"]
+        sqs_queue["SQS Queue"]
+        subgraph Observability
+            direction LR
+            cloudwatch["CloudWatch <br/>(Logs, Metrics, Alarms)"]
+            sns["SNS Topic"]
+        end
+
+        %% 3. The Core VPC for a Single Region
+        subgraph VPC ["VPC"]
+            
+            %% Public Subnets with Load Balancer
+            subgraph Public_Subnets ["Public Subnets (Multi-AZ)"]
+                alb["Application <br/> Load Balancer"]
+            end
+
+            %% Availability Zone 1
+            subgraph AZ1 ["Availability Zone 1"]
+                subgraph Private_Subnet_1 ["Private Subnet"]
+                    ecs_tasks_1["ECS Tasks <br/> (API GW, Backend, Frontend, <br/> Search, Notification Worker)"]
+                    rds_primary["RDS Primary"]
+                    elasticache_1["ElastiCache Node"]
+                    opensearch_1["OpenSearch Node"]
+                end
+            end
+            
+            %% Availability Zone 2
+            subgraph AZ2 ["Availability Zone 2"]
+                subgraph Private_Subnet_2 ["Private Subnet"]
+                    ecs_tasks_2["ECS Tasks <br/> (API GW, Backend, Frontend, <br/> Search, Notification Worker)"]
+                    rds_standby["RDS Standby <br/> Replica"]
+                    elasticache_2["ElastiCache Node"]
+                    opensearch_2["OpenSearch Node"]
+                end
+            end
+        end
+    end
+    
+    %% --- Define Relationships ---
+    %% 1. Initial User Connection
+    user_client -- "1.DNS Lookup" --> route53
+    route53 -- "2.Routes to nearest region's ALB/CDN" --> user_client
+
+    %% 2. Traffic Flow to Edge
+    user_client -- "3a.Loads Static Assets" --> cloudfront
+    user_client -- "3b.API & Search Traffic" --> alb
+
+    %% 3. CDN to Origin
+    cloudfront -- "Pulls Images" --> s3_bucket
+    cloudfront -- "Pulls UI Assets" --> alb
+
+    %% 4. Load Balancer to Application
+    alb -- "Distributes Traffic" --> ecs_tasks_1 & ecs_tasks_2
+    
+    %% 5. Application to Data Stores
+    ecs_tasks_1 & ecs_tasks_2 -- "Writes (Primary)" --> rds_primary
+    ecs_tasks_1 & ecs_tasks_2 -- "Reads (Standby can be used for reads)" --> rds_standby
+    ecs_tasks_1 & ecs_tasks_2 -- "R/W Cache" --> elasticache_1 & elasticache_2
+    ecs_tasks_1 & ecs_tasks_2 -- "R/W Search Index" --> opensearch_1 & opensearch_2
+    rds_primary -- "Sync Replication" --> rds_standby
+    
+    %% 6. Async & Object Storage Flow
+    ecs_tasks_1 & ecs_tasks_2 -- "Publishes Job" --> sqs_queue
+    ecs_tasks_1 & ecs_tasks_2 -- "Consumes Job & Sends Email" --> sqs_queue & email_service
+    ecs_tasks_1 & ecs_tasks_2 -- "Uploads to" --> s3_bucket
+
+    %% 7. Observability Flow
+    alb & ecs_tasks_1 & ecs_tasks_2 & rds_primary & rds_standby -- "Sends Logs & Metrics" --> cloudwatch
+    cloudwatch -- "Triggers Alarm" --> sns
+    sns -- "Sends Notification" --> on_call_engineer
+
+    %% --- Styling ---
+    classDef aws_cloud fill:#FF9900,stroke:#333;
+    classDef global fill:#9C27B0,stroke:white,color:white;
+    classDef cdn_style fill:#4CAF50,stroke:#333;
+    classDef vpc_style fill:#f2f2f2,stroke:#333;
+    classDef az fill:#DDEBF8,stroke:#333;
+    classDef managed_service fill:#5A97DB,stroke:#333;
+    classDef obs fill:#9C27B0,stroke:white,color:white;
+    
+    class AWS_Cloud aws_cloud
+    class VPC,Public_Subnets,Private_Subnet_1,Private_Subnet_2 vpc_style
+    class AZ1,AZ2 az
+    class s3_bucket,sqs_queue,rds_primary,rds_standby,elasticache_1,elasticache_2,opensearch_1,opensearch_2 managed_service
+    class cloudfront cdn_style
+    class route53 global
+    class cloudwatch,sns obs
+```
